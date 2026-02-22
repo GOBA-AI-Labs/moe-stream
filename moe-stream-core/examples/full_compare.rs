@@ -5,9 +5,7 @@ use moe_stream_core::gguf::reader::GgufReader;
 use std::fs;
 use std::io::Write;
 
-fn out_dir() -> String {
-    std::env::temp_dir().join("gguf_verify").to_string_lossy().to_string()
-}
+const OUT_DIR: &str = "/tmp/gguf_verify";
 
 fn save_f32(data: &[f32], path: &str) {
     let mut file = fs::File::create(path).expect("Failed to create file");
@@ -20,8 +18,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let path = args.get(1).expect("Usage: full_compare <gguf>");
 
-    let dir = out_dir();
-    fs::create_dir_all(&dir).ok();
+    fs::create_dir_all(OUT_DIR).ok();
 
     let reader = GgufReader::open(path).expect("Failed to open GGUF");
 
@@ -43,7 +40,7 @@ fn main() {
 
         match result {
             Ok((data, shape)) => {
-                let out_path = format!("{}/rust_{}.bin", dir, label);
+                let out_path = format!("{}/rust_{}.bin", OUT_DIR, label);
                 save_f32(&data, &out_path);
                 println!(
                     "[Rust] {}: shape={:?}, elements={}, saved to {}",
@@ -59,11 +56,5 @@ fn main() {
         }
     }
 
-    println!(
-        "Done. Compare with: python3 -c 'import numpy as np; \
-         r=np.fromfile(\"{dir}/rust_X.bin\",np.float32); \
-         p=np.fromfile(\"{dir}/python_X.bin\",np.float32); \
-         print(f\"max_diff={{np.max(np.abs(r-p))}}\")'",
-        dir = dir
-    );
+    println!("Done. Compare with: python3 -c 'import numpy as np; r=np.fromfile(\"/tmp/gguf_verify/rust_X.bin\",np.float32); p=np.fromfile(\"/tmp/gguf_verify/python_X.bin\",np.float32); print(f\"max_diff={{np.max(np.abs(r-p))}}\")'");
 }

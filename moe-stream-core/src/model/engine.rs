@@ -1527,7 +1527,27 @@ impl Engine {
         self.preload_norms()?;
         self.preload_shared_experts()?;
         if self.config.is_deltanet_hybrid() {
-            self.preload_deltanet()?;
+            // Estimate DeltaNet F32 memory: ~470MB/layer for Qwen3.5 (d_inner=8192)
+            let dn_layers = (0..self.config.num_layers)
+                .filter(|&i| !self.config.is_attention_layer(i))
+                .count();
+            let dn_est_mb = dn_layers as f64
+                * (self.config.ssm_conv_dim() * self.config.hidden_size  // attn_qkv
+                 + self.config.ssm_d_inner * self.config.hidden_size     // attn_gate
+                 + self.config.hidden_size * self.config.ssm_d_inner     // ssm_out
+                 + 2 * self.config.ssm_dt_rank * self.config.hidden_size // ssm_ba
+                ) as f64 * 4.0 / 1e6;
+            let ram_mb = get_system_ram().unwrap_or(24_000_000_000) as f64 / 1e6;
+
+            if dn_est_mb > ram_mb * 0.5 {
+                log::info!(
+                    "DeltaNet streaming mode: estimated {:.0}MB > 50% of {:.0}MB RAM, skipping preload",
+                    dn_est_mb, ram_mb
+                );
+                // DeltaNet weights will be loaded from mmap on demand (SSD streaming)
+            } else {
+                self.preload_deltanet()?;
+            }
             self.preload_attention()?;
         } else {
             self.preload_attention()?;
@@ -1689,12 +1709,14 @@ impl Engine {
         // (MXFP4 Metal, QMatMul, or Dense F16)
         if !self.resident.gpu_experts.is_empty() && !self.resident.gpu_experts[0].is_empty() {
             let token = Tensor::zeros((1, h), candle_core::DType::F32, dev)?;
-            if let Some(expert) = self.resident.gpu_experts[0].iter().flatten().next() {
-                let _ = expert.gate.forward(&token)?;
-                let _ = expert.up.forward(&token)?;
-                let mid = Tensor::zeros((1, intermediate), candle_core::DType::F32, dev)?;
-                let _ = expert.down.forward(&mid)?;
-                // One expert is enough to compile the shader
+            for expert_opt in self.resident.gpu_experts[0].iter() {
+                if let Some(expert) = expert_opt {
+                    let _ = expert.gate.forward(&token)?;
+                    let _ = expert.up.forward(&token)?;
+                    let mid = Tensor::zeros((1, intermediate), candle_core::DType::F32, dev)?;
+                    let _ = expert.down.forward(&mid)?;
+                    break; // One expert is enough to compile the shader
+                }
             }
         }
 
@@ -1794,6 +1816,8 @@ impl Engine {
                 self.reader.prefetch_tensor(&format!("{}.attn_gate.weight", prefix));
                 self.reader.prefetch_tensor(&format!("{}.ssm_in.weight", prefix));
                 self.reader.prefetch_tensor(&format!("{}.ssm_ba.weight", prefix));
+                self.reader.prefetch_tensor(&format!("{}.ssm_alpha.weight", prefix));
+                self.reader.prefetch_tensor(&format!("{}.ssm_beta.weight", prefix));
                 self.reader.prefetch_tensor(&format!("{}.ssm_a", prefix));
                 self.reader.prefetch_tensor(&format!("{}.ssm_dt.bias", prefix));
                 self.reader.prefetch_tensor(&format!("{}.ssm_conv1d.weight", prefix));

@@ -29,10 +29,8 @@ pub enum InferenceMode {
 
 /// User's device preference for inference mode selection.
 #[derive(Debug, Clone, Copy, PartialEq)]
-#[derive(Default)]
 pub enum DevicePreference {
     /// Auto-detect best mode based on model size, RAM, and GPU availability.
-    #[default]
     Auto,
     /// Force GPU Resident mode (Metal).
     Gpu,
@@ -40,6 +38,11 @@ pub enum DevicePreference {
     Cpu,
 }
 
+impl Default for DevicePreference {
+    fn default() -> Self {
+        DevicePreference::Auto
+    }
+}
 
 impl std::fmt::Display for InferenceMode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -458,7 +461,7 @@ impl StreamingConfig {
     /// GPT-OSS pattern (dense_first=false): even layers = SWA, odd layers = full.
     /// Returns false if sliding_window is 0 (disabled).
     pub fn is_swa_layer(&self, layer_idx: usize) -> bool {
-        self.sliding_window > 0 && layer_idx.is_multiple_of(2)
+        self.sliding_window > 0 && layer_idx % 2 == 0
     }
 
     /// Effective k_max for dynamic K (0 means use num_experts_per_tok).

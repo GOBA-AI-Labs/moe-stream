@@ -5,6 +5,7 @@ pub mod kv_cache;
 pub mod cache;
 pub mod engine;
 pub mod deltanet;
+pub mod train;
 
 pub use layer::LayerForward;
 pub use kv_cache::KvCache;

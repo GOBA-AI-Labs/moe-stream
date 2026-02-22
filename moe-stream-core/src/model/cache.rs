@@ -70,15 +70,11 @@ impl GpuExpertProjection {
             }
             #[cfg(feature = "metal")]
             GpuExpertProjection::Mxfp4Metal(buffer, out_features, in_features, _device) => {
-                crate::metal::mxfp4_matmul_metal_gpu(buffer, input, *out_features, *in_features)
+                crate::metal::mxfp4_matmul_metal_gpu_batched(buffer, input, *out_features, *in_features)
             }
             #[cfg(feature = "metal")]
             GpuExpertProjection::Mxfp4Packed(buffer, _offset, out_features, in_features, _device) => {
-                // For per-expert forward, use the packed buffer with offset.
-                // The Mxfp4MatmulOp CustomOp handles the actual dispatch.
-                // Note: offset is handled by the packed buffer's expert slice.
-                // For individual dispatch, we still use the offset-aware path.
-                crate::metal::mxfp4_matmul_metal_gpu_offset(buffer, *_offset, input, *out_features, *in_features)
+                crate::metal::mxfp4_matmul_metal_gpu_offset_batched(buffer, *_offset, input, *out_features, *in_features)
             }
         }
     }

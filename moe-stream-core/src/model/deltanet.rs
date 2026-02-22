@@ -92,8 +92,10 @@ pub fn deinterleave_ssm_ba(ssm_ba: &Tensor, config: &StreamingConfig) -> Result<
     Tensor::cat(&[&flat_beta, &flat_alpha], 0)
 }
 
-/// Load DeltaNet input projections, supporting both Unsloth format (split attn_qkv + attn_gate)
-/// and llama.cpp format (single ssm_in with per-group interleaved QKVZ).
+/// Load DeltaNet input projections, supporting three formats:
+/// 1. Unsloth format: split attn_qkv + attn_gate + ssm_ba (Qwen3-Coder-Next 80B)
+/// 2. Unsloth split-ba format: attn_qkv + attn_gate + ssm_alpha + ssm_beta (Qwen3.5 397B)
+/// 3. llama.cpp format: single ssm_in with per-group interleaved QKVZ
 ///
 /// Returns: (attn_qkv, attn_gate, ssm_ba, is_llamacpp_format)
 pub fn load_deltanet_projections(
@@ -107,7 +109,21 @@ pub fn load_deltanet_projections(
         // Unsloth format: already de-interleaved
         let attn_qkv = load_weight(reader, &qkv_name, cpu)?;
         let attn_gate = load_weight(reader, &format!("{}.attn_gate.weight", prefix), cpu)?;
-        let ssm_ba = load_weight(reader, &format!("{}.ssm_ba.weight", prefix), cpu)?;
+
+        let ba_name = format!("{}.ssm_ba.weight", prefix);
+        let ssm_ba = if reader.tensors.contains_key(&ba_name) {
+            // Combined ssm_ba (Qwen3-Coder-Next style)
+            load_weight(reader, &ba_name, cpu)?
+        } else {
+            // Split ssm_alpha + ssm_beta (Qwen3.5 style)
+            // Each is [hidden_size, num_v_heads]. Cat along dim 0 (output dim) to get
+            // [hidden_size, 2*num_v_heads] in flat [all_beta, all_alpha] layout —
+            // matching what deinterleave_ssm_ba would produce.
+            let ssm_beta = load_weight(reader, &format!("{}.ssm_beta.weight", prefix), cpu)?;
+            let ssm_alpha = load_weight(reader, &format!("{}.ssm_alpha.weight", prefix), cpu)?;
+            Tensor::cat(&[&ssm_beta, &ssm_alpha], 0)?
+        };
+
         Ok((attn_qkv, attn_gate, ssm_ba, false))
     } else {
         // llama.cpp format: single ssm_in with per-group interleaved QKVZ

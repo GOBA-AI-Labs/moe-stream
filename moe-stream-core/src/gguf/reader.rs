@@ -507,7 +507,7 @@ impl GgufReader {
 
         // Validate size
         let block_size = ggml_dtype.block_size();
-        if !n_elements.is_multiple_of(block_size) {
+        if n_elements % block_size != 0 {
             return Err(GgufError::Parse {
                 msg: format!(
                     "expert elements {} not divisible by block size {}",
@@ -563,7 +563,7 @@ impl GgufReader {
         };
 
         let block_size = ggml_dtype.block_size();
-        if !n_elements.is_multiple_of(block_size) {
+        if n_elements % block_size != 0 {
             return Err(GgufError::Parse {
                 msg: format!(
                     "tensor {} elements {} not divisible by block size {}",

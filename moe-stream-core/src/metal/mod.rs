@@ -903,6 +903,30 @@ mod inner {
         input.apply_op1_no_bwd(&op)
     }
 
+    /// Batched MXFP4 matmul for prefill (seq_len > 1).
+    ///
+    /// The MXFP4 kernel is a matvec (single row). For multi-row inputs (prefill),
+    /// we iterate over rows and enqueue all kernels on candle's shared command buffer
+    /// (no per-row sync). For single-row inputs (decode), delegates directly.
+    pub fn mxfp4_matmul_metal_gpu_batched(
+        weight_buffer: &Arc<Buffer>,
+        input: &candle_core::Tensor,
+        out_features: usize,
+        in_features: usize,
+    ) -> Result<candle_core::Tensor> {
+        use candle_core::IndexOp;
+        let n_rows = input.dim(0)?;
+        if n_rows <= 1 {
+            return mxfp4_matmul_metal_gpu(weight_buffer, input, out_features, in_features);
+        }
+        let mut rows = Vec::with_capacity(n_rows);
+        for i in 0..n_rows {
+            let row = input.i(i)?.contiguous()?;
+            rows.push(mxfp4_matmul_metal_gpu(weight_buffer, &row, out_features, in_features)?);
+        }
+        candle_core::Tensor::cat(&rows, 0)
+    }
+
     /// Perform MXFP4 matrix-vector multiply with a byte offset into the weight buffer.
     /// Used for packed per-layer buffers (Mxfp4Packed variant).
     pub fn mxfp4_matmul_metal_gpu_offset(
@@ -914,6 +938,27 @@ mod inner {
     ) -> Result<candle_core::Tensor> {
         let op = Mxfp4MatmulOp::new_with_offset(Arc::clone(weight_buffer), weight_offset, out_features, in_features);
         input.apply_op1_no_bwd(&op)
+    }
+
+    /// Batched MXFP4 matmul with offset for prefill (seq_len > 1).
+    pub fn mxfp4_matmul_metal_gpu_offset_batched(
+        weight_buffer: &Arc<Buffer>,
+        weight_offset: u64,
+        input: &candle_core::Tensor,
+        out_features: usize,
+        in_features: usize,
+    ) -> Result<candle_core::Tensor> {
+        use candle_core::IndexOp;
+        let n_rows = input.dim(0)?;
+        if n_rows <= 1 {
+            return mxfp4_matmul_metal_gpu_offset(weight_buffer, weight_offset, input, out_features, in_features);
+        }
+        let mut rows = Vec::with_capacity(n_rows);
+        for i in 0..n_rows {
+            let row = input.i(i)?.contiguous()?;
+            rows.push(mxfp4_matmul_metal_gpu_offset(weight_buffer, weight_offset, &row, out_features, in_features)?);
+        }
+        candle_core::Tensor::cat(&rows, 0)
     }
 
     // =========================================================================
@@ -1069,6 +1114,30 @@ mod inner {
             quant_type,
         };
         input.apply_op1_no_bwd(&op)
+    }
+
+    /// Batched quantized attention matmul for prefill (seq_len > 1).
+    ///
+    /// Same strategy as `mxfp4_matmul_metal_gpu_batched`: iterate over rows for
+    /// multi-row inputs since the Q5_0/Q8_0 kernel is a matvec.
+    pub fn quantized_attn_matmul_metal_gpu_batched(
+        weight_buffer: &Arc<Buffer>,
+        input: &candle_core::Tensor,
+        out_features: usize,
+        in_features: usize,
+        quant_type: QuantizedAttnType,
+    ) -> Result<candle_core::Tensor> {
+        use candle_core::IndexOp;
+        let n_rows = input.dim(0)?;
+        if n_rows <= 1 {
+            return quantized_attn_matmul_metal_gpu(weight_buffer, input, out_features, in_features, quant_type);
+        }
+        let mut rows = Vec::with_capacity(n_rows);
+        for i in 0..n_rows {
+            let row = input.i(i)?.contiguous()?;
+            rows.push(quantized_attn_matmul_metal_gpu(weight_buffer, &row, out_features, in_features, quant_type)?);
+        }
+        candle_core::Tensor::cat(&rows, 0)
     }
 
     // =========================================================================

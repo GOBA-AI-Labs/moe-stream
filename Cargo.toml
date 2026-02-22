@@ -1,5 +1,6 @@
 [workspace]
 members = [
     "moe-stream-core",
+    "moe-stream-server",
 ]
 resolver = "2"

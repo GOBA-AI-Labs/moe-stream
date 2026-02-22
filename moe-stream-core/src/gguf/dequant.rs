@@ -2,7 +2,6 @@
 //!
 //! Direct port of fast_dequant.c with Rust safety + potential NEON SIMD.
 //! Block formats match ggml/llama.cpp specification.
-#![allow(clippy::needless_range_loop)]
 
 use half::f16;
 
@@ -604,7 +603,7 @@ fn e8m0_to_f32_half(e: u8) -> f32 {
 /// Low nibble qs[j] & 0x0F -> element [j], high nibble qs[j] >> 4 -> element [j+16].
 /// Dequantization: output[i] = MXFP4_VALUES[nibble] * e8m0_to_f32_half(e)
 pub fn dequantize_mxfp4(block_data: &[u8], n_elements: usize) -> Vec<f32> {
-    assert!(n_elements.is_multiple_of(MXFP4_BLOCK_ELEMENTS));
+    assert!(n_elements % MXFP4_BLOCK_ELEMENTS == 0);
     let n_blocks = n_elements / MXFP4_BLOCK_ELEMENTS;
     assert!(block_data.len() >= n_blocks * MXFP4_BLOCK_SIZE);
 
@@ -644,14 +643,14 @@ pub fn mxfp4_matvec_mul(
     out_features: usize,
     in_features: usize,
 ) -> Vec<f32> {
-    debug_assert!(in_features.is_multiple_of(MXFP4_BLOCK_ELEMENTS));
+    debug_assert!(in_features % MXFP4_BLOCK_ELEMENTS == 0);
     let blocks_per_row = in_features / MXFP4_BLOCK_ELEMENTS;
     let row_bytes = blocks_per_row * MXFP4_BLOCK_SIZE;
 
     let num_threads = std::thread::available_parallelism()
         .map(|n| n.get().min(out_features))
         .unwrap_or(1);
-    let chunk_size = out_features.div_ceil(num_threads);
+    let chunk_size = (out_features + num_threads - 1) / num_threads;
 
     let mut output = vec![0.0f32; out_features];
 
@@ -731,7 +730,7 @@ pub fn dequant_matvec_q5_0(
     out_features: usize,
     in_features: usize,
 ) -> Vec<f32> {
-    debug_assert!(in_features.is_multiple_of(LEGACY_BLOCK_ELEMENTS));
+    debug_assert!(in_features % LEGACY_BLOCK_ELEMENTS == 0);
     let blocks_per_row = in_features / LEGACY_BLOCK_ELEMENTS;
     let row_bytes = blocks_per_row * Q5_0_BLOCK_SIZE;
     let mut output = vec![0.0f32; out_features];
@@ -774,7 +773,7 @@ pub fn dequant_matvec_q8_0(
     out_features: usize,
     in_features: usize,
 ) -> Vec<f32> {
-    debug_assert!(in_features.is_multiple_of(LEGACY_BLOCK_ELEMENTS));
+    debug_assert!(in_features % LEGACY_BLOCK_ELEMENTS == 0);
     let blocks_per_row = in_features / LEGACY_BLOCK_ELEMENTS;
     let row_bytes = blocks_per_row * Q8_0_BLOCK_SIZE;
     let mut output = vec![0.0f32; out_features];

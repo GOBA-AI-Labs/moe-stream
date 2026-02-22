@@ -3,7 +3,6 @@
 //! Loads weights on-demand from memory-mapped GGUF, dequantizes to Metal,
 //! runs forward, then drops weights. This is the core of SSD streaming.
 //! Supports Expert LRU cache and resident weight pre-loading for speed.
-#![allow(clippy::needless_range_loop)]
 //!
 //! For hybrid models (Qwen3-Coder-Next), dispatches to DeltaNet for linear
 //! attention layers and standard attention for full attention layers.
@@ -262,12 +261,6 @@ pub struct ProfileStats {
     pub prefill_ms: f64,
     pub embed_ms: f64,
     pub lm_head_ms: f64,
-}
-
-impl Default for ProfileStats {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl ProfileStats {
@@ -555,9 +548,9 @@ impl<'a> LayerForward<'a> {
                     macro_rules! proj {
                         ($mx_field:ident, $qm_field:ident, $dense_w:expr) => {
                             if let Some(m) = mx.map(|m| &m.$mx_field) {
-                                crate::metal::mxfp4_matmul_metal_gpu(&m.buffer, &flat, m.out_features, m.in_features)?
+                                crate::metal::mxfp4_matmul_metal_gpu_batched(&m.buffer, &flat, m.out_features, m.in_features)?
                             } else if let Some(q) = qm.and_then(|q| q.$qm_field.as_ref()) {
-                                crate::metal::quantized_attn_matmul_metal_gpu(&q.buffer, &flat, q.out_features, q.in_features, q.quant_type)?
+                                crate::metal::quantized_attn_matmul_metal_gpu_batched(&q.buffer, &flat, q.out_features, q.in_features, q.quant_type)?
                             } else {
                                 // Weight already on compute_device from preload_attention()
                                 flat.matmul(&$dense_w.t()?)?
@@ -719,9 +712,9 @@ impl<'a> LayerForward<'a> {
             let mxfp4_o = attn_ref.and_then(|a| a.mxfp4.as_ref()).map(|m| &m.o);
             let qmetal_o = attn_ref.and_then(|a| a.quantized_metal.as_ref()).and_then(|q| q.o.as_ref());
             if let Some(mx) = mxfp4_o {
-                crate::metal::mxfp4_matmul_metal_gpu(&mx.buffer, &attn_out, mx.out_features, mx.in_features)?
+                crate::metal::mxfp4_matmul_metal_gpu_batched(&mx.buffer, &attn_out, mx.out_features, mx.in_features)?
             } else if let Some(qm) = qmetal_o {
-                crate::metal::quantized_attn_matmul_metal_gpu(&qm.buffer, &attn_out, qm.out_features, qm.in_features, qm.quant_type)?
+                crate::metal::quantized_attn_matmul_metal_gpu_batched(&qm.buffer, &attn_out, qm.out_features, qm.in_features, qm.quant_type)?
             } else {
                 attn_out.matmul(&o_weight.t()?)?
             }
@@ -1911,7 +1904,7 @@ impl<'a> LayerForward<'a> {
 
                 // Apply shared expert gate (sigmoid scaling)
                 let shexp_output = if let Some(gate_w) = &shexp_gate_inp_w {
-                    let gate_logits = hidden_compute.broadcast_mul(gate_w)?;
+                    let gate_logits = hidden_compute.broadcast_mul(&gate_w)?;
                     let gate_logits = gate_logits.sum_keepdim(1)?;
                     let gate_sigmoid = ops::sigmoid(&gate_logits)?;
                     shexp_output.broadcast_mul(&gate_sigmoid)?

@@ -77,7 +77,7 @@ fn main() {
     let k = Tensor::randn(0.0f32, 1.0, (1, 4, 1, 128), &device).unwrap();
     let v = Tensor::randn(0.0f32, 1.0, (1, 4, 1, 128), &device).unwrap();
     let scale = 1.0 / (128.0f64).sqrt();
-    let out = ops::scaled_dot_product_attention(&q, &k, &v, scale, false, None, None).unwrap();
+    let out = ops::scaled_dot_product_attention(&q, &k, &v, scale, false).unwrap();
     println!("SDPA output shape: {:?}", out.dims());
 
     println!("\nAll Metal ops verified!");

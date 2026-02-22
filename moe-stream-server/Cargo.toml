@@ -1,0 +1,36 @@
+[package]
+name = "moe-stream-server"
+version = "0.1.0"
+edition = "2021"
+description = "OpenAI-compatible HTTP server for moe-stream inference engine"
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "moe-stream-server"
+path = "src/main.rs"
+
+[features]
+default = []
+metal = ["moe-stream-core/metal"]
+accelerate = ["moe-stream-core/accelerate", "metal"]
+cuda = ["moe-stream-core/cuda"]
+
+[dependencies]
+moe-stream-core = { path = "../moe-stream-core" }
+axum = { version = "0.8", features = ["json"] }
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+chrono = "0.4"
+clap = { version = "4", features = ["derive"] }
+log = "0.4"
+env_logger = "0.11"
+tower-http = { version = "0.6", features = ["cors"] }
+candle-core = "0.8"
+rand = "0.8"
+rmcp = { version = "0.16", features = ["server", "transport-io"] }
+schemars = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
