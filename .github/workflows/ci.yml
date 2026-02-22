@@ -80,7 +80,6 @@ jobs:
         with:
           cuda: "12.4.1"
           method: local
-          sub-packages: '["nvcc", "cudart"]'
 
       - name: Build with CUDA
         run: >
