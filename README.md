@@ -45,33 +45,30 @@ These models have varying expert counts per layer and **require moe-stream** for
 
 ```bash
 # macOS (recommended)
-cargo build --release -p moe-stream-core --features accelerate
+cargo build --release -p moe-stream-core --bin moe-stream --features accelerate
 
 # macOS with Metal GPU support
-cargo build --release -p moe-stream-core --features metal,accelerate
+cargo build --release -p moe-stream-core --bin moe-stream --features metal,accelerate
 
 # Linux (CPU-only)
-cargo build --release -p moe-stream-core
+cargo build --release -p moe-stream-core --bin moe-stream
 
 # Linux with CUDA (experimental)
-cargo build --release -p moe-stream-core --features cuda
+cargo build --release -p moe-stream-core --bin moe-stream --features cuda
 ```
 
 ### Generate Text
 
 ```bash
-# Basic generation (auto-preloads all resident weights)
-cargo run --release -p moe-stream-core --example generate -- \
-  path/to/model.gguf
+# Basic generation
+./target/release/moe-stream path/to/model.gguf
 
 # With prompt and streaming output
-cargo run --release -p moe-stream-core --example generate -- \
-  path/to/model.gguf 100 \
+./target/release/moe-stream path/to/model.gguf 100 \
   --prompt "def fibonacci(n):" --stream
 
 # Run as a persistent JSONL server
-cargo run --release -p moe-stream-core --example generate -- \
-  path/to/model.gguf --server
+./target/release/moe-stream path/to/model.gguf --server
 ```
 
 Place a `tokenizer.json` in the same directory as your GGUF file for automatic tokenizer detection, or pass `--tokenizer path/to/tokenizer.json` explicitly.
@@ -151,8 +148,8 @@ moe-stream/
 │   │   ├── ops/               # Activation, attention, norm operations
 │   │   ├── metal/             # Apple Metal GPU compute (feature-gated)
 │   │   └── tokenizer.rs       # Tokenizer wrapper
-│   └── examples/
-│       └── generate.rs        # CLI generation tool + JSONL server
+│   └── src/bin/
+│       └── moe-stream.rs      # CLI binary + JSONL server
 └── docs/                      # Technical documentation
 ```
 

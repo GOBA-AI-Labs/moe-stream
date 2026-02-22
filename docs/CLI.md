@@ -1,11 +1,11 @@
 # CLI Reference
 
-The `generate` example provides both one-shot text generation and a persistent JSONL server mode.
+The `moe-stream` binary provides both one-shot text generation and a persistent JSONL server mode.
 
 ## Usage
 
 ```
-generate <gguf_path> [max_tokens] [OPTIONS]
+moe-stream <gguf_path> [max_tokens] [OPTIONS]
 ```
 
 ## Arguments
@@ -68,7 +68,7 @@ generate <gguf_path> [max_tokens] [OPTIONS]
 ### One-Shot Generation (80B)
 
 ```bash
-cargo run --release -p moe-stream-core --example generate -- \
+./target/release/moe-stream \
   models/Qwen3-Coder-Next-Q4_K_M-official/Qwen3-Coder-Next-Q4_K_M.gguf 100 \
   --preload-gates --preload-attn \
   --prompt "def fibonacci(n):" --stream
@@ -77,7 +77,7 @@ cargo run --release -p moe-stream-core --example generate -- \
 ### One-Shot Generation (30B)
 
 ```bash
-cargo run --release -p moe-stream-core --example generate -- \
+./target/release/moe-stream \
   models/Qwen3-Coder-30B-A3B-Q4_K_M.gguf 50 \
   --preload-gates --preload-attn \
   --prompt "Write a Python function to sort a list." --stream
@@ -88,7 +88,7 @@ cargo run --release -p moe-stream-core --example generate -- \
 Start the server:
 
 ```bash
-cargo run --release -p moe-stream-core --example generate -- \
+./target/release/moe-stream \
   models/Qwen3-Coder-Next-Q4_K_M-official/Qwen3-Coder-Next-Q4_K_M.gguf \
   --server --preload-gates --preload-attn
 ```
