@@ -6,25 +6,115 @@ on:
   pull_request:
     branches: [main]
 
-jobs:
-  build:
-    strategy:
-      matrix:
-        os: [macos-latest, ubuntu-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --release -p moe-stream-core
-      - run: cargo build --release -p moe-stream-core --examples
-      - run: cargo test -p moe-stream-core
-      - run: cargo clippy -p moe-stream-core -- -D warnings
-      - run: cargo doc -p moe-stream-core --no-deps
+env:
+  CARGO_TERM_COLOR: always
 
-  build-metal:
-    runs-on: macos-latest
+jobs:
+  macos-arm64:
+    name: macOS arm64 (Metal + Accelerate)
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --release -p moe-stream-core --features metal,accelerate
-      - run: cargo build --release -p moe-stream-core --features metal,accelerate --examples
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: >
+          cargo build
+          --workspace
+          --exclude moe-stream-desktop
+          --exclude moe-stream-python
+          --features metal,accelerate
+
+      - name: Test
+        run: >
+          cargo test
+          --workspace
+          --exclude moe-stream-desktop
+          --exclude moe-stream-python
+          --features metal,accelerate
+
+      - name: Clippy
+        run: >
+          cargo clippy
+          --all-targets
+          --workspace
+          --exclude moe-stream-desktop
+          --exclude moe-stream-python
+          --features metal,accelerate
+          -- -D warnings
+
+  linux-x86_64:
+    name: Linux x86_64 (CPU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: >
+          cargo build
+          --workspace
+          --exclude moe-stream-desktop
+          --exclude moe-stream-python
+
+      - name: Test
+        run: >
+          cargo test
+          --workspace
+          --exclude moe-stream-desktop
+          --exclude moe-stream-python
+
+  linux-cuda:
+    name: Linux CUDA (build only)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install CUDA toolkit
+        uses: Jimver/cuda-toolkit@v0.2.18
+        with:
+          cuda: "12.6.3"
+          method: network
+          sub-packages: '["nvcc", "cudart"]'
+
+      - name: Build with CUDA
+        run: >
+          cargo build
+          --workspace
+          --exclude moe-stream-desktop
+          --exclude moe-stream-python
+          --features cuda
+
+  clippy-linux:
+    name: Clippy (Linux, no features)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: >
+          cargo clippy
+          --all-targets
+          --workspace
+          --exclude moe-stream-desktop
+          --exclude moe-stream-python
+          -- -D warnings

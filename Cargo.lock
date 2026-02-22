@@ -3013,7 +3013,7 @@ dependencies = [
 
 [[package]]
 name = "moe-stream-agent"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "candle-core",
  "clap",
@@ -3076,10 +3076,11 @@ dependencies = [
 
 [[package]]
 name = "moe-stream-python"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "moe-stream-core",
  "pyo3",
+ "rand 0.8.5",
 ]
 
 [[package]]

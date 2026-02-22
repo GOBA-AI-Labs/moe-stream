@@ -2,12 +2,14 @@
 
 SSD-streaming MoE inference engine for consumer hardware. Run 80B parameter Mixture-of-Experts models on a 24GB Apple Silicon Mac.
 
-## Why moe-stream?
+## Highlights
 
-- **Layer-adaptive pruned model support** -- handles models with different expert counts per layer (`experts_per_layer` metadata), which llama.cpp does not currently support
 - **3 inference modes** -- GPU Resident, GPU Hybrid, SSD Streaming, auto-selected based on model size vs system RAM
-- **OpenAI-compatible HTTP server** -- `POST /v1/chat/completions` (SSE streaming + JSON), connect from any OpenAI client
+- **Layer-adaptive pruned model support** -- handles models with different expert counts per layer (`experts_per_layer` metadata)
+- **OpenAI-compatible HTTP server** -- `POST /v1/chat/completions` (SSE streaming + JSON)
 - **MCP server** -- expose inference as MCP tools for AI agent integration
+- **MCP client + Agent runtime** -- connect to external MCP servers, skills/hooks
+- **Tauri desktop app** -- native macOS GUI with React frontend
 - **Metal GPU kernels** -- fused MXFP4 matvec, Q5_0/Q8_0 attention, RoPE, RMSNorm on Apple Silicon
 - **Q4 quantized matmul** -- skip dequantization, compute directly on Q4 weights for +79% speedup
 - **JSONL server mode** -- persistent stdin/stdout server for benchmarking pipelines
@@ -20,11 +22,7 @@ SSD-streaming MoE inference engine for consumer hardware. Run 80B parameter Mixt
 | Qwen3-30B-A3B | 48 Attention, 128 experts top-8 | 30B total / 3B active | ~55 tok/s (GPU Resident) |
 | GPT-OSS-20B | 24 layers, 32 experts top-8, MXFP4 | 20B total | ~17 tok/s (GPU Resident) |
 
-Additional model architectures (Llama, Mistral, DeepSeek, etc.) can be added via the `ModelAdapter` trait in `config.rs`.
-
 ### PrunedHub Models
-
-moe-stream is the recommended inference engine for [PrunedHub](https://huggingface.co/GOBA-AI-Labs) models, which use layer-adaptive expert pruning:
 
 | Model | Size | MMLU | Notes |
 |-------|------|------|-------|
@@ -32,8 +30,6 @@ moe-stream is the recommended inference engine for [PrunedHub](https://huggingfa
 | [PrunedHub-GPT-OSS-20B-27x-Zerobias](https://huggingface.co/goba-ai-labs/PrunedHub-GPT-OSS-20B-27x-Zerobias) | 9.4 GB | 77% | Zerobias cliff recovery |
 | [PrunedHub-Qwen3-30B-A3B-JP-80pct](https://huggingface.co/goba-ai-labs/PrunedHub-Qwen3-30B-A3B-JP-80pct) | 14.0 GB | 74% | Japanese-aware pruning |
 | [PrunedHub-Qwen3-Coder-Next-50pct](https://huggingface.co/goba-ai-labs/PrunedHub-Qwen3-Coder-Next-50pct) | 24.4 GB | 72% | 80B model, 50% experts kept |
-
-These models have varying expert counts per layer and **require moe-stream** for inference (llama.cpp does not support `experts_per_layer`).
 
 ## Quick Start
 
@@ -46,28 +42,28 @@ These models have varying expert counts per layer and **require moe-stream** for
 ### Build
 
 ```bash
-# macOS (recommended: Metal GPU + vecLib acceleration)
+# CLI binary (macOS, recommended)
 cargo build --release -p moe-stream-core --bin moe-stream --features metal,accelerate
 
-# Build the HTTP/MCP server
+# HTTP/MCP server
 cargo build --release -p moe-stream-server --features metal,accelerate
+
+# Agent CLI (MCP client + skills/hooks)
+cargo build --release -p moe-stream-agent --features metal,accelerate
+
+# Desktop app (Tauri + React)
+cd moe-stream-desktop-ui && npm install && cd ..
+cargo build --release -p moe-stream-desktop --features metal,accelerate
 
 # Linux (CPU-only)
 cargo build --release -p moe-stream-core --bin moe-stream
-
-# Linux with CUDA (experimental)
-cargo build --release -p moe-stream-core --bin moe-stream --features cuda
 ```
 
 ### CLI Inference
 
 ```bash
-# Interactive generation
 ./target/release/moe-stream path/to/model.gguf 100 \
   --prompt "def fibonacci(n):" --stream
-
-# JSONL server (stdin/stdout)
-./target/release/moe-stream path/to/model.gguf --server
 ```
 
 ### OpenAI-Compatible Server
@@ -85,38 +81,33 @@ curl http://localhost:11434/v1/chat/completions \
 export OPENAI_BASE_URL=http://localhost:11434/v1
 ```
 
-### MCP Server (AI Agent Integration)
+### MCP Server
 
 ```bash
-# Start as MCP server (stdio transport)
 ./target/release/moe-stream-server --model path/to/model.gguf --mcp-stdio
 ```
 
-Add to your MCP client configuration (e.g., `.claude/mcp.json`):
-```json
-{
-  "mcpServers": {
-    "moe-stream": {
-      "command": "./target/release/moe-stream-server",
-      "args": ["--model", "path/to/model.gguf", "--mcp-stdio"]
-    }
-  }
-}
+### Agent CLI
+
+```bash
+# Interactive agent with MCP tools and skills
+./target/release/moe-stream-agent --model path/to/model.gguf
+
+# With MCP server connections
+./target/release/moe-stream-agent --model path/to/model.gguf \
+  --mcp-config .moe-stream/mcp.json
 ```
 
-Place a `tokenizer.json` in the same directory as your GGUF file for automatic tokenizer detection, or pass `--tokenizer path/to/tokenizer.json` explicitly.
+### Desktop App
 
-See [docs/CLI.md](docs/CLI.md) for the full CLI reference.
-
-### Pre-built Binaries
-
-Pre-built macOS and Linux binaries are available on the [Releases](https://github.com/GOBA-AI-Labs/moe-stream/releases) page. No Rust toolchain required.
+```bash
+cd moe-stream-desktop
+cargo tauri dev --features metal,accelerate
+```
 
 ## Architecture
 
 ### Inference Modes
-
-The engine automatically selects the inference mode based on model size vs system RAM:
 
 | Mode | Condition | Strategy |
 |------|-----------|----------|
@@ -125,6 +116,16 @@ The engine automatically selects the inference mode based on model size vs syste
 | **SSD Streaming** | GGUF > 90% RAM | Minimal resident memory, experts from NVMe |
 
 Override with `--device gpu` or `--device cpu`.
+
+### GPU Resident Architecture
+
+```
+  +--------+    +----------------------------+    +---------+
+  |  GGUF  +--->|    Metal GPU Compute       +--->| Output  |
+  |  (load |    | (embed, attention, experts,|    | Tokens  |
+  |  once) |    |  norms, LM head -- all GPU)|    +---------+
+  +--------+    +----------------------------+
+```
 
 ### SSD Streaming Architecture
 
@@ -142,17 +143,17 @@ Override with `--device gpu` or `--device cpu`.
   +--------+    +------------------------+
 ```
 
-### GPU Resident Architecture
+### Platform Architecture
 
 ```
-  +--------+    +----------------------------+    +---------+
-  |  GGUF  +--->|    Metal GPU Compute       +--->| Output  |
-  |  (load |    | (embed, attention, experts,|    | Tokens  |
-  |  once) |    |  norms, LM head -- all GPU)|    +---------+
-  +--------+    +----------------------------+
+moe-stream/
+├── moe-stream-core/        # Pure Rust inference engine (no HTTP/async deps)
+├── moe-stream-server/      # OpenAI HTTP + MCP server (axum + tokio)
+├── moe-stream-agent/       # MCP client + Agent runtime + CLI
+├── moe-stream-desktop/     # Tauri v2 GUI (Engine direct-linked)
+├── moe-stream-desktop-ui/  # React + Vite frontend
+└── moe-stream-python/      # PyO3 bindings (Engine, generate, chat)
 ```
-
-Custom Metal kernels for MXFP4 (4-bit MX format), Q5_0/Q8_0 quantized attention, fused RoPE, and fused RMSNorm eliminate CPU-GPU transfer overhead.
 
 ## Performance
 
@@ -160,16 +161,10 @@ Measured on Apple M4 Pro, 24GB unified memory, internal NVMe SSD.
 
 | Configuration | Size | Mode | Decode Speed |
 |---------------|------|------|--------------|
-| GPT-OSS-20B Pruned (MXFP4) | 10.4 GB | GPU Resident | ~17 tok/s |
+| GPT-OSS-20B Pruned (MXFP4) | 10.4 GB | GPU Resident | ~20 tok/s |
 | 30B-A3B Pruned-80% (Q4_K_M) | 14.0 GB | GPU Resident | ~55 tok/s |
 | 80B 50% pruned (Q4_K_M) | 24.4 GB | SSD Streaming | ~2.1 tok/s |
 | 80B Q4_K_M Original | ~48 GB | SSD Streaming | ~0.6 tok/s |
-
-## `experts_per_layer` Support
-
-moe-stream supports the `experts_per_layer` GGUF metadata field, enabling inference on layer-adaptive pruned models where each layer retains a different number of experts.
-
-Standard MoE inference engines assume a uniform expert count across all layers. Layer-adaptive pruning produces models where some layers retain all experts (important layers) while others are aggressively pruned. moe-stream reads the per-layer expert count from the GGUF metadata and correctly routes tokens to the available experts in each layer.
 
 ## Project Structure
 
@@ -203,8 +198,42 @@ moe-stream/
 │       ├── types.rs            # OpenAI-compatible request/response types
 │       ├── routes/             # HTTP endpoints (chat, models, health)
 │       └── mcp/                # MCP server (stdio transport)
-└── docs/                       # Technical documentation
+├── moe-stream-agent/           # MCP client + Agent runtime
+│   └── src/
+│       ├── main.rs             # Agent CLI entry
+│       ├── mcp_client.rs       # MCP server process management
+│       ├── tool_registry.rs    # Tool aggregation (built-in + MCP)
+│       ├── tool_call_parser.rs # Model output <tool_call> extraction
+│       ├── skill_loader.rs     # .moe-stream/skills/*.md parsing
+│       ├── agent_def.rs        # .moe-stream/agents/*.md parsing
+│       ├── runtime.rs          # Agent runtime (generate + tool loop)
+│       └── cli/                # Interactive REPL + commands
+├── moe-stream-desktop/         # Tauri v2 native desktop app
+│   └── src/
+│       ├── lib.rs              # Tauri commands (generate, model_info, agents)
+│       └── engine_handle.rs    # Engine thread bridge for Tauri
+├── moe-stream-desktop-ui/      # React + Vite frontend
+│   └── src/
+│       ├── App.tsx             # Main app component
+│       ├── components/         # Chat, ModelSelector, ToolPanel, etc.
+│       └── hooks/              # useEngine, useChat, etc.
+├── moe-stream-python/          # PyO3 bindings (Engine, generate, chat)
+├── docs/                       # Technical documentation
+└── scripts/                    # Benchmark scripts
 ```
+
+## Key Design: EngineHandle
+
+Engine is `&mut self` + non-Send (Metal handles), so it runs on a dedicated OS thread with channel-based communication:
+
+```rust
+enum EngineCommand {
+    ChatCompletion { messages, params, token_tx, cancel_rx },
+    GetModelInfo { reply: oneshot::Sender<ModelInfo> },
+}
+```
+
+Server, Agent, and Desktop all share this pattern via `EngineHandle`.
 
 ## Links
 
@@ -212,6 +241,47 @@ moe-stream/
 - [PrunedHub Models](https://huggingface.co/GOBA-AI-Labs) -- pre-pruned models on HuggingFace
 - [docs/CLI.md](docs/CLI.md) -- CLI and server API reference
 - [docs/TECHNOLOGY.md](docs/TECHNOLOGY.md) -- detailed technical overview
+- [docs/GPU_AUTO_SELECT.md](docs/GPU_AUTO_SELECT.md) -- inference mode auto-selection
+
+## CUDA (Linux)
+
+CUDA support is available as a feature flag. It uses candle's CUDA backend -- no custom CUDA kernels.
+
+### Requirements
+
+- Linux x86_64
+- CUDA Toolkit 12.0+ (`nvcc` on PATH)
+- NVIDIA driver 525+
+- cuDNN 8+ (optional, for attention acceleration)
+
+### Build
+
+```bash
+# Build with CUDA support
+cargo build --release -p moe-stream-core --bin moe-stream --features cuda
+cargo build --release -p moe-stream-server --features cuda
+
+# Check CUDA detection
+./target/release/moe-stream --help
+```
+
+### Inference Mode Selection
+
+On CUDA, the inference mode auto-detection uses **GPU VRAM** (not system RAM):
+
+| GGUF Size vs VRAM | Mode |
+|-------------------|------|
+| < 80% VRAM | GPU Resident (all weights on CUDA) |
+| 80-90% VRAM | GPU Hybrid (attention on GPU, experts on CPU/SSD) |
+| > 90% VRAM | SSD Streaming (CPU + SSD) |
+
+Override with `--device gpu` (force GPU Resident) or `--device cpu` (force CPU).
+
+### Notes
+
+- CUDA + Metal cannot be enabled simultaneously (compile-time exclusive)
+- GPU Resident mode requires the full model to fit in VRAM
+- Performance depends on GPU model; A100/H100 expected >100 tok/s for 20B models
 
 ## License
 
@@ -219,15 +289,3 @@ Dual-licensed under your choice of:
 
 - [MIT License](LICENSE-MIT)
 - [Apache License, Version 2.0](LICENSE-APACHE)
-
-## Contributing
-
-Contributions are welcome! Please:
-
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/my-feature`)
-3. Ensure your changes build: `cargo build --release --features metal,accelerate`
-4. Run tests: `cargo test`
-5. Open a pull request
-
-When reporting bugs, please include your hardware (especially RAM size), OS version, and the model you are using.

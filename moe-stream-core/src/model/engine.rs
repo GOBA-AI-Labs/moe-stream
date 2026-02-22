@@ -73,6 +73,21 @@ fn get_system_ram() -> Option<u64> {
     }
 }
 
+/// Get CUDA GPU total memory in bytes.
+/// Uses candle's CudaDevice to query the device.
+#[cfg(feature = "cuda")]
+fn get_cuda_gpu_memory() -> Option<u64> {
+    // Try to get CUDA device memory via nvidia-smi as a fallback.
+    // candle doesn't expose a direct memory query API.
+    let output = std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.total", "--format=csv,noheader,nounits", "--id=0"])
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mib: u64 = stdout.trim().parse().ok()?;
+    Some(mib * 1024 * 1024)
+}
+
 /// Sampling parameters for token generation.
 #[derive(Clone, Debug)]
 pub struct SamplingParams {
@@ -395,7 +410,19 @@ impl Engine {
 
         let file_size = reader.file_size() as u64;
         let has_metal = matches!(device, Device::Metal(_));
+        let has_cuda = matches!(device, Device::Cuda(_));
+        let has_gpu = has_metal || has_cuda;
         let system_ram = get_system_ram();
+        // For CUDA, use GPU VRAM for threshold (not system RAM).
+        // For Metal (unified memory), system RAM = GPU memory.
+        #[cfg(feature = "cuda")]
+        let gpu_mem: Option<u64> = if has_cuda {
+            get_cuda_gpu_memory()
+        } else {
+            system_ram
+        };
+        #[cfg(not(feature = "cuda"))]
+        let gpu_mem: Option<u64> = system_ram;
 
         // Determine inference mode.
         //
@@ -427,35 +454,36 @@ impl Engine {
                 }
             }
             DevicePreference::Auto => {
-                if let Some(ram) = system_ram {
-                    let ram_gb = ram as f64 / 1e9;
+                if let Some(mem) = gpu_mem {
+                    let mem_gb = mem as f64 / 1e9;
                     let file_gb = file_size as f64 / 1e9;
-                    let ratio_pct = file_size as f64 / ram as f64 * 100.0;
+                    let ratio_pct = file_size as f64 / mem as f64 * 100.0;
+                    let gpu_label = if has_cuda { "CUDA VRAM" } else { "RAM" };
 
-                    if has_metal && file_size < (ram as f64 * 0.80) as u64 {
-                        // Model GGUF fits in <80% of RAM → all weights on Metal GPU
+                    if has_gpu && file_size < (mem as f64 * 0.80) as u64 {
+                        // Model GGUF fits in <80% of GPU memory → all weights on GPU
                         log::info!(
-                            "Inference mode: GPU Resident (GGUF {:.1}GB = {:.0}% of {:.1}GB RAM < 80%)",
-                            file_gb, ratio_pct, ram_gb,
+                            "Inference mode: GPU Resident (GGUF {:.1}GB = {:.0}% of {:.1}GB {} < 80%)",
+                            file_gb, ratio_pct, mem_gb, gpu_label,
                         );
                         InferenceMode::GpuResident
-                    } else if has_metal && file_size < (ram as f64 * 0.90) as u64 {
-                        // Model 80-90% of RAM → attention on GPU, experts from SSD
+                    } else if has_gpu && file_size < (mem as f64 * 0.90) as u64 {
+                        // Model 80-90% of GPU memory → attention on GPU, experts from SSD/RAM
                         log::info!(
-                            "Inference mode: GPU+SSD Hybrid (GGUF {:.1}GB = {:.0}% of {:.1}GB RAM, 80-90%)",
-                            file_gb, ratio_pct, ram_gb,
+                            "Inference mode: GPU+SSD Hybrid (GGUF {:.1}GB = {:.0}% of {:.1}GB {}, 80-90%)",
+                            file_gb, ratio_pct, mem_gb, gpu_label,
                         );
                         InferenceMode::GpuHybrid
                     } else {
-                        // Model >90% of RAM → full CPU+SSD streaming
+                        // Model >90% of GPU memory → full CPU+SSD streaming
                         log::info!(
-                            "Inference mode: CPU+SSD Streaming (GGUF {:.1}GB = {:.0}% of {:.1}GB RAM > 90%)",
-                            file_gb, ratio_pct, ram_gb,
+                            "Inference mode: CPU+SSD Streaming (GGUF {:.1}GB = {:.0}% of {:.1}GB {} > 90%)",
+                            file_gb, ratio_pct, mem_gb, gpu_label,
                         );
                         InferenceMode::SsdStreaming
                     }
                 } else {
-                    log::info!("Inference mode: SSD Streaming (could not detect system RAM)");
+                    log::info!("Inference mode: SSD Streaming (could not detect GPU/system memory)");
                     InferenceMode::SsdStreaming
                 }
             }

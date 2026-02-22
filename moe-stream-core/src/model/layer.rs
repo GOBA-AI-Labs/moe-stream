@@ -837,16 +837,16 @@ impl<'a> LayerForward<'a> {
         };
 
         // === GPU-routed zero-sync fast path ===
-        // When all conditions are met, perform softmax+topk+MoE entirely on GPU
+        // When conditions are met, perform softmax+topk+MoE entirely on GPU
         // with zero CPU sync (eliminates 24 GPU syncs/token → 0).
-        // Conditions: GPU Resident + single token + fixed K + no profiling + MXFP4 packed.
+        // Conditions: GPU Resident + single token + fixed K + MXFP4 packed.
+        // Profiling (entropy_out/routing_stats_out) is handled post-hoc with a single
+        // GPU→CPU sync — still far cheaper than the ~480 dispatch fallback path.
         #[cfg(feature = "metal")]
         if is_gpu_resident
             && bsz * seq_len == 1
             && !self.config.dynamic_k_enabled
             && !self.config.adaptive_skip_enabled
-            && entropy_out.is_none()
-            && routing_stats_out.is_none()
         {
             if let (Some(packed), Some(routing_offsets), Some(routing_out)) = (
                 &resident.packed_mxfp4[layer_idx],
@@ -875,6 +875,35 @@ impl<'a> LayerForward<'a> {
                     bias_buffers,
                     moe_buffers,
                 )?;
+
+                // Post-hoc profiling: read routing data from GPU when requested.
+                // This adds 1 GPU→CPU sync (router_logits readback) only when profiling
+                // is active — normal inference remains zero-sync.
+                if entropy_out.is_some() || routing_stats_out.is_some() {
+                    let top_k = self.config.num_experts_per_tok;
+                    // Single GPU→CPU sync: read the small router logits vector
+                    let logits_vec: Vec<f32> = router_logits.flatten_all()?.to_vec1::<f32>()?;
+                    let logits_cpu = Tensor::from_vec(
+                        logits_vec, (1, n_experts_actual), &Device::Cpu,
+                    )?;
+
+                    if entropy_out.is_some() {
+                        *entropy_out = Some(compute_router_entropy(&logits_cpu)?);
+                    }
+
+                    if routing_stats_out.is_some() {
+                        // Compute top-k on CPU from logits (same as fallback path).
+                        // The GPU already computed top-k for MoE dispatch, but reading
+                        // Metal buffers directly requires unsafe code. CPU top-k on 32
+                        // experts is negligible (~100ns).
+                        let (topk_w, topk_i) = top_k_routing(
+                            &logits_cpu, top_k, self.config.norm_topk_prob, use_oai_swiglu,
+                        )?;
+                        let indices = topk_i.flatten_all()?.to_vec1::<u32>()?;
+                        let weights = topk_w.flatten_all()?.to_vec1::<f32>()?;
+                        *routing_stats_out = Some((indices, weights));
+                    }
+                }
 
                 // Handle shared expert (if any)
                 let mut output = moe_output;
