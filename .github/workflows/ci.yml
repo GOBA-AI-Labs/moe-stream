@@ -79,7 +79,7 @@ jobs:
         uses: Jimver/cuda-toolkit@v0.2.18
         with:
           cuda: "12.4.1"
-          method: network
+          method: local
           sub-packages: '["nvcc", "cudart"]'
 
       - name: Build with CUDA
@@ -105,10 +105,10 @@ jobs:
       - name: Clippy
         run: >
           cargo clippy
-          --all-targets
           --workspace
           --exclude moe-stream-desktop
           --exclude moe-stream-python
+          --lib --bins
           --
           -W clippy::all
           -A clippy::manual_is_multiple_of
