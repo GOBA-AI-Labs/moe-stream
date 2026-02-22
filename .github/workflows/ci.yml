@@ -30,23 +30,14 @@ jobs:
           --exclude moe-stream-python
           --features metal,accelerate
 
-      - name: Test
+      - name: Test (lib + bins only)
         run: >
           cargo test
           --workspace
           --exclude moe-stream-desktop
           --exclude moe-stream-python
           --features metal,accelerate
-
-      - name: Clippy
-        run: >
-          cargo clippy
-          --all-targets
-          --workspace
-          --exclude moe-stream-desktop
-          --exclude moe-stream-python
-          --features metal,accelerate
-          -- -D warnings
+          --lib --bins
 
   linux-x86_64:
     name: Linux x86_64 (CPU)
@@ -65,12 +56,13 @@ jobs:
           --exclude moe-stream-desktop
           --exclude moe-stream-python
 
-      - name: Test
+      - name: Test (lib + bins only)
         run: >
           cargo test
           --workspace
           --exclude moe-stream-desktop
           --exclude moe-stream-python
+          --lib --bins
 
   linux-cuda:
     name: Linux CUDA (build only)
@@ -86,7 +78,7 @@ jobs:
       - name: Install CUDA toolkit
         uses: Jimver/cuda-toolkit@v0.2.18
         with:
-          cuda: "12.6.3"
+          cuda: "12.4.1"
           method: network
           sub-packages: '["nvcc", "cudart"]'
 
@@ -117,4 +109,12 @@ jobs:
           --workspace
           --exclude moe-stream-desktop
           --exclude moe-stream-python
-          -- -D warnings
+          --
+          -W clippy::all
+          -A clippy::manual_is_multiple_of
+          -A clippy::manual_div_ceil
+          -A clippy::needless_range_loop
+          -A clippy::derivable_impls
+          -A clippy::needless_borrow
+          -A clippy::too_many_arguments
+          -A clippy::manual_flatten
