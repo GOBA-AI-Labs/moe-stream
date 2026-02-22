@@ -1,0 +1,39 @@
+# Build artifacts
+target/
+*.dylib
+*.so
+*.dll
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+*.whl
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Models (too large for git)
+models/
+*.gguf
+
+# Env
+.env
+
+# AI tool configs
+.claude/
+.serena/
+.mcp.json
+.ai-context/
+
+# Benchmark outputs
+benchmark_results/

@@ -1,0 +1,32 @@
+[package]
+name = "moe-stream-core"
+version = "0.1.0"
+edition = "2021"
+description = "SSD-streaming MoE inference engine for consumer hardware"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/GOBA-AI-Labs/moe-stream"
+
+[features]
+default = []
+metal = ["candle-core/metal", "candle-nn/metal", "dep:metal"]
+accelerate = ["candle-core/accelerate"]
+cuda = ["candle-core/cuda", "candle-nn/cuda"]
+mkl = ["candle-core/mkl"]
+
+[dependencies]
+candle-core = "0.8"
+candle-nn = "0.8"
+memmap2 = "0.9"
+half = { version = "2.4", features = ["num-traits"] }
+byteorder = "1.5"
+rayon = "1.10"
+linked-hash-map = "0.5"
+thiserror = "2.0"
+libc = "0.2"
+log = "0.4"
+env_logger = "0.11"
+tokenizers = "0.21"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rand = "0.8"
+metal = { version = "0.27", optional = true }

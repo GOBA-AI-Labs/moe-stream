@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release -p moe-stream-core
+      - run: cargo build --release -p moe-stream-core --examples
+      - run: cargo test -p moe-stream-core
+      - run: cargo clippy -p moe-stream-core -- -D warnings
+      - run: cargo doc -p moe-stream-core --no-deps
+
+  build-metal:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release -p moe-stream-core --features metal,accelerate
+      - run: cargo build --release -p moe-stream-core --features metal,accelerate --examples
