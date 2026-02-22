@@ -2,14 +2,13 @@
 
 ## What is it?
 
-moe-stream is an inference engine designed to run large AI models on consumer hardware.
-It enables running 80B parameter models on a 24GB MacBook.
+moe-stream is an inference engine designed to run large MoE (Mixture of Experts) AI models on consumer hardware. It enables running 80B parameter models on a 24GB MacBook.
 
-**Core idea**: MoE (Mixture of Experts) models use only 2-3% of their total parameters to generate each token. The unused 97% can stay on SSD -- only the needed parts are loaded.
+**Core idea**: MoE models use only 2-3% of their total parameters per token. moe-stream exploits this sparsity with three inference modes: GPU Resident (all weights on Metal GPU), GPU Hybrid, and SSD Streaming (expert weights loaded on-demand from NVMe).
 
 ```
 Traditional: 80B model -> 160GB RAM required -> not feasible for most users
-moe-stream:  80B MoE   -> 4GB RAM + SSD      -> runs on a MacBook
+moe-stream:  80B MoE   -> GPU Resident (if fits) or SSD Streaming -> runs on a MacBook
 ```
 
 ---
@@ -18,18 +17,65 @@ moe-stream:  80B MoE   -> 4GB RAM + SSD      -> runs on a MacBook
 
 | Technology | What it does | Impact |
 |-----------|-------------|--------|
-| Expert Slicing | Loads only selected experts from SSD | 94% memory reduction |
-| mmap + madvise Batch | Leverages NVMe parallelism for expert loading | Maximum SSD bandwidth utilization |
-| RAM Resident Mode | Keeps all weights in RAM for smaller models | Zero SSD I/O |
+| GPU Resident Mode | All weights on Metal GPU for small models | ~17-55 tok/s |
+| SSD Streaming | Loads only selected experts from SSD | 80B on 24GB Mac |
+| Custom Metal Kernels | MXFP4 matvec, Q5_0/Q8_0 attention, fused RoPE/RMSNorm | No CPU-GPU transfer overhead |
+| mmap + madvise Batch | Leverages NVMe parallelism for expert loading | Maximum SSD bandwidth |
 | Dynamic K | Adjusts expert count based on routing entropy | +12.7% speedup |
-| CPU/Metal Hybrid | Selects CPU or GPU based on operation size | +10% speedup |
-| Hybrid Architecture | Supports DeltaNet (linear) + Attention (quadratic) | 80B O(n) inference |
-| Auto Config | Auto-detects model properties from GGUF metadata | Zero configuration |
-| GGUF Dequant | On-the-fly F32 conversion for 13+ quantization formats | 1/4 storage |
+| Q4 Quantized MatMul | Computes directly on Q4 weights (skip dequant) | +79% speedup |
+| Hybrid Architecture | DeltaNet (linear) + Attention (quadratic) | 80B O(n) inference |
+| experts_per_layer | Per-layer variable expert counts | Layer-adaptive pruned model support |
+| Auto Config | Auto-detects model properties from GGUF | Zero configuration |
 
 ---
 
-## 1. Expert Slicing -- Precision I/O for MoE
+## 1. Inference Modes
+
+### GPU Resident (< 80% system RAM)
+
+All weights loaded into Metal GPU memory at startup. Zero SSD I/O during inference.
+
+```
+  +--------+    +----------------------------+    +---------+
+  |  GGUF  +--->|    Metal GPU Compute       +--->| Output  |
+  |  (load |    | (embed, attention, experts,|    | Tokens  |
+  |  once) |    |  norms, LM head -- all GPU)|    +---------+
+  +--------+    +----------------------------+
+```
+
+Custom Metal kernels handle all quantization types natively on GPU:
+- **MXFP4**: Custom `mxfp4.metal` shader (4-bit MX format matvec)
+- **Q5_0/Q8_0**: Custom `quantized_attn.metal` shader for attention
+- **Q4_K, Q6_K, etc.**: candle QMatMul (native Metal)
+- **Fused ops**: RoPE + RMSNorm in single kernel dispatch (`fused_ops.metal`)
+
+Multi-row batched wrappers handle prefill (seq_len > 1) by dispatching per-row Metal kernel calls within a single command buffer.
+
+### GPU Hybrid (80-90% system RAM)
+
+Attention weights reside on GPU. MoE expert weights stream from SSD on demand.
+
+### SSD Streaming (> 90% system RAM)
+
+Embedding and LM head on Metal GPU. Expert weights read from mmap'd GGUF via NVMe.
+
+```
+                    +------------------+
+                    |   Metal GPU      |
+                    |  (embed + LM     |
+                    |   head only)     |
+                    +--------+---------+
+                             |
+  +--------+    +------------v-----------+    +---------+
+  |  GGUF  +--->|    CPU Compute         +--->| Output  |
+  |  mmap  |    | (MoE experts, DeltaNet,|    | Tokens  |
+  |  NVMe  |    |  Attention, Norms)     |    +---------+
+  +--------+    +------------------------+
+```
+
+---
+
+## 2. Expert Slicing -- Precision I/O for MoE
 
 ### MoE Model Structure
 
@@ -45,19 +91,9 @@ moe-stream:  80B MoE   -> 4GB RAM + SSD      -> runs on a MacBook
 
 **Only top-10/512 experts = 2% of total are used per token.**
 
-### Existing Approaches vs moe-stream
-
-```
-AirLLM approach:     Load entire layer -> 512 experts x 0.84MB = 430MB/layer
-moe-stream approach: Load top-10 only  -> 10 experts x 0.84MB = 8.4MB/layer
-
-Reduction: 98%
-```
-
 ### Implementation
 
-Expert weights in a GGUF file are stored as stacked tensors `[n_experts, intermediate, hidden]`.
-Given an expert_idx, only that slice is read from the mmap'd file.
+Expert weights in GGUF are stored as stacked tensors `[n_experts, intermediate, hidden]`. Given an expert_idx, only that slice is read from the mmap'd file.
 
 ```
 GGUF file (48.5GB, mmap'd)
@@ -71,15 +107,9 @@ GGUF file (48.5GB, mmap'd)
 
 ---
 
-## 2. mmap + madvise Batch -- Leveraging NVMe Parallelism
+## 3. mmap + madvise Batch -- NVMe Parallelism
 
-### Why mmap?
-
-SSD reads are delegated to the OS page cache.
-`madvise(WILLNEED)` tells the OS "this address range will be used soon",
-allowing the NVMe SSD to handle page faults **in parallel**.
-
-### Batch Prefetch Flow
+`madvise(WILLNEED)` tells the OS to prefetch address ranges, allowing the NVMe controller to handle page faults in parallel.
 
 ```
 1. Router computation -> identify top-10 experts (CPU, < 1ms)
@@ -95,234 +125,143 @@ allowing the NVMe SSD to handle page faults **in parallel**.
 3. Process experts sequentially (already paged in)
 ```
 
-### I/O Optimization Results
+---
 
-| Approach | Result | Why |
-|----------|--------|-----|
-| **mmap + madvise batch** | **Fastest** | Maximizes NVMe parallelism |
-| CPU routing | +10% | Eliminates Metal-to-CPU sync barrier |
-| F_NOCACHE pread | -13% | Serial I/O loses NVMe parallelism |
-| MADV_FREE eviction | +/-0% | Kernel LRU already optimal |
-| Expert LRU cache | -20% | Memory pressure on 24GB |
-| Async I/O thread | -21% | Contention with NVMe |
-| Speculative madvise | -4% | Page cache contention |
+## 4. Custom Metal GPU Kernels
 
-**Conclusion**: On 24GB + 48.5GB model, mmap + madvise batch is the optimal approach. SSD bandwidth is the bottleneck.
+### MXFP4 Matvec (`mxfp4.metal`)
+
+4-bit MX format (Microscaling) matrix-vector multiply. Ported from llama.cpp's `kernel_mul_mv_mxfp4_f32`. Handles E8M0 exponent decode + LUT lookup + simdgroup reduction entirely on GPU.
+
+### Quantized Attention (`quantized_attn.metal`)
+
+Q5_0 and Q8_0 quantized attention matvec. Eliminates CPU dequantization for attention Q/K/V/O projections in GPU Resident mode.
+
+### Fused Operations (`fused_ops.metal`)
+
+RoPE (Rotary Position Embedding) and RMSNorm in single kernel dispatch, avoiding multiple GPU-CPU round-trips.
+
+### Batched Prefill
+
+Metal matvec kernels process single rows. For prefill (seq_len > 1), batched wrapper functions loop over rows and dispatch all operations within a single Metal command buffer, leveraging GPU automatic batching.
 
 ---
 
-## 3. RAM Resident Mode -- Keep Everything in Memory
+## 5. Dynamic K -- Entropy-based Expert Selection
 
-### Auto-detection
-
-```
-Compute total F32-expanded weight size:
-  expert_f32 = layers x experts x 3 x intermediate x hidden x 4 bytes
-
-Compare against 75% of system RAM:
-  Fits     -> RAM Resident (all weights resident, zero SSD I/O)
-  Too large -> SSD Streaming (only experts streamed from SSD)
-```
-
-### 3-tier Expert Retrieval
+"High-confidence tokens need fewer experts; uncertain tokens need more"
 
 ```
-When an expert is needed:
-
-1. In resident.experts[layer][expert]?   -> RAM Resident mode, use immediately
-   | not found
-2. In expert_cache.get(layer, expert)?   -> LRU cache hit
-   | not found
-3. Load from SSD mmap + dequant          -> SSD Streaming
+"The capital of France is" -> low entropy -> K=2 sufficient -> fast
+"The best way to"          -> high entropy -> K=10 needed   -> accurate
 ```
 
----
-
-## 4. Dynamic K -- Entropy-based Adaptive Expert Selection
-
-### Concept
-
-"High-confidence tokens need fewer experts; uncertain tokens need more experts"
-
+Algorithm:
 ```
-"The capital of France is" -> next token is almost certainly "Paris"
-  -> low entropy -> K=2 is sufficient -> fast
-
-"The best way to" -> many possible continuations
-  -> high entropy -> K=10 needed -> accurate
-```
-
-### Algorithm
-
-```
-1. Router logits -> softmax -> probability distribution P
+1. Router logits -> softmax -> P
 2. Entropy H = -sum(p * ln(p))
-3. Normalize: H_norm = H / ln(n_experts)   <- 0.0 to 1.0
+3. Normalize: H_norm = H / ln(n_experts)
 4. K = round(k_min + H_norm * (k_max - k_min))
 ```
 
-### Results
-
-- **+12.7% speedup** on 80B model (0.59 -> 0.64+ tok/s)
-- Quality: 5/5 test cases PASS (output matches llama.cpp)
-- Average K: fixed 10 -> dynamic 7.2 (28% fewer expert computations)
+Result: **+12.7% speedup**, average K from 10 to 7.2 (28% fewer expert computations).
 
 ---
 
-## 5. CPU/Metal Hybrid -- Size-based Dispatch
+## 6. Q4 Quantized MatMul
 
-### Why CPU is Faster for MoE Decode
+Skip dequantization entirely. Compute matrix-vector products directly on Q4-quantized weights using integer arithmetic.
 
-Matrix sizes during single-token generation:
-
-```
-Expert MLP:  [1, 2048] x [2048, 768]  <- tiny
-Attention:   [1, 2048] x [2048, 2048] <- small
-
-Metal kernel launch: 10-50us x hundreds of ops = several ms
-CPU compute time: < 1ms
--> Metal overhead exceeds actual compute time
-```
-
-### Dispatch Strategy
-
-```
-Metal (GPU):
-  +-- Embedding lookup:  [151936, 2048] x token_id -> large
-  +-- LM Head:           [2048, 151936] x hidden   -> large
-
-CPU:
-  +-- Router gate:       [1, 2048] x [2048, 512]   -> medium, avoids sync
-  +-- Expert MLP:        [1, 2048] x [2048, 768]   -> small
-  +-- Attention QKV:     [1, 2048] x [2048, 512]   -> small (resident)
-  +-- RMSNorm:           element-wise               -> small
-  +-- RoPE:              element-wise               -> small
-```
-
-**CPU routing is especially important**: Placing gate weights on CPU eliminates one Metal-to-CPU sync barrier (waiting for GPU-to-CPU hidden state transfer). +10% speed improvement.
+Set `QUANTIZED_MATMUL=1` to enable. Result: **+79% speedup** in SSD Streaming mode (1.16 -> 2.07 tok/s). Greedy output is bit-identical to dequantized path.
 
 ---
 
-## 6. Hybrid Architecture -- DeltaNet + Attention
+## 7. `experts_per_layer` -- Layer-Adaptive Pruned Models
+
+Standard MoE engines assume uniform expert count across all layers. moe-stream reads the `experts_per_layer` GGUF metadata field to support models where each layer retains a different number of experts.
+
+This enables inference on layer-adaptive pruned models (e.g., PrunedHub models) where important layers keep all experts while others are aggressively pruned.
+
+---
+
+## 8. Hybrid Architecture -- DeltaNet + Attention
 
 ### Qwen3-Coder-Next 80B Structure
 
 ```
-All 48 layers:
+48 layers:
   Layer 0:  DeltaNet  (linear attention, O(n))
   Layer 1:  DeltaNet
   Layer 2:  DeltaNet
-  Layer 3:  Attention (full attention, O(n^2)) <- every 4th layer
-  Layer 4:  DeltaNet
+  Layer 3:  Attention (full attention, O(n^2))  <- every 4th layer
   ...
   Layer 47: Attention
 
 36 DeltaNet + 12 Attention layers
 ```
 
-### DeltaNet (State Space Model)
-
-- **Linear time complexity O(n)**: proportional to sequence length (vs quadratic for Attention)
-- Recurrent computation with sequential state vector updates
-- Conv1D captures local patterns
-- Gated output controls information flow
-
-### Partial RoPE
-
-```
-Of head_dim = 256:
-  First 64 dimensions: RoPE (Rotary Position Embedding) applied
-  Remaining 192 dimensions: unchanged
-
--> Balances positional information in the hybrid DeltaNet + Attention design
-```
+DeltaNet layers use linear-time recurrent computation with sequential state vector updates, Conv1D for local patterns, and gated output.
 
 ---
 
-## 7. Auto Config -- GGUF Metadata-driven Configuration
+## 9. Auto Config -- GGUF Metadata-driven
 
-### Zero-configuration Auto-detection
-
-Simply opening a GGUF file automatically determines all settings:
+Opening a GGUF file automatically configures all settings:
 
 ```
-Extracted from GGUF metadata:
-  +-- architecture:         "qwen2moe" / "qwen3_next"
-  +-- hidden_size:          2048 / 4096
-  +-- num_layers:           24 / 48
-  +-- num_experts:          60 / 128 / 512
-  +-- num_experts_per_tok:  4 / 8 / 10
-  +-- ...
+From GGUF metadata:
+  architecture, hidden_size, num_layers, num_experts,
+  num_experts_per_tok, experts_per_layer, ...
 
-Inferred from model name:
-  +-- norm_topk_prob:  Qwen1.5/2 -> false, Qwen3+ -> true
-  +-- attention bias:  Qwen1.5 -> yes, Qwen3 -> no
+Inferred from model family:
+  norm_topk_prob, attention bias, chat template format
 
-Determined from system environment:
-  +-- inference_mode:  system_ram vs F32 expanded size
+From system environment:
+  inference_mode (GPU Resident / GPU Hybrid / SSD Streaming)
 ```
-
-### Why This Matters
-
-A single misconfiguration like `norm_topk_prob` produces garbage output.
-By auto-detecting model family differences, users don't need to configure anything.
-
----
-
-## 8. GGUF Dequantization -- 13+ Quantization Formats
-
-### Supported Formats
-
-```
-Q2_K, Q3_K, Q4_K, Q5_K, Q6_K    <- K-quant family
-Q4_0, Q4_1, Q5_0, Q5_1            <- Legacy formats
-Q8_0, Q8_1                         <- High-precision quants
-F16, F32                           <- Unquantized
-```
-
-### On-the-fly Conversion
-
-```
-On SSD: Q4_K_M (4.5 bits/weight) -> 48.5GB for 80B model
-At compute time: Convert to F32 (32 bits/weight) for operations
-Conversion: Block-level (256 elements/block) for efficient decoding
-```
-
-Storage savings: **~7x** compared to F32
 
 ---
 
 ## Performance Summary
 
-### Measured on 24GB M4 Pro MacBook
+Measured on Apple M4 Pro, 24GB unified memory, internal NVMe SSD.
 
-| Model | Parameters | Resident RAM | Speed | Mode |
-|-------|-----------|-------------|-------|------|
-| Qwen3-Coder-Next 80B | 80B (~3B active per token) | 4GB | ~2.1 tok/s | SSD Streaming |
-| Qwen3-30B-A3B | 30B (active 3B) | 4GB | 0.75 tok/s | SSD Streaming |
-| GPT-OSS-20B Pruned | 20B | ~10GB | ~55 tok/s | GPU Resident |
+| Model | Size | Mode | Speed |
+|-------|------|------|-------|
+| GPT-OSS-20B Pruned (MXFP4) | 10.4 GB | GPU Resident | ~17 tok/s |
+| 30B-A3B Pruned-80% (Q4_K_M) | 14.0 GB | GPU Resident | ~55 tok/s |
+| 80B 50% pruned (Q4_K_M) | 24.4 GB | SSD Streaming | ~2.1 tok/s |
+| 80B Q4_K_M Original | ~48 GB | SSD Streaming | ~0.6 tok/s |
 
-### Comparison
-
-```
-llama.cpp (Qwen1.5-MoE, fully RAM-resident): 102 tok/s
-moe-stream (same model, SSD Streaming):       1.12 tok/s
--> SSD streaming is ~100x slower. But it can run models that don't fit in RAM.
-
-llama.cpp (80B, 24GB Mac): Cannot run (out of memory)
-moe-stream (80B, 24GB Mac): ~2.1 tok/s
--> Slow, but it works. Much better than not running at all.
-```
-
-### Bottleneck Analysis
+### Bottleneck Analysis (SSD Streaming)
 
 ```
-Per-token breakdown (80B, SSD streaming mode):
+Per-token breakdown (80B):
   SSD I/O (expert loading):     ~60%  <- primary bottleneck
-  Dequantization (Q4 -> F32):   ~25%
+  Dequantization (Q4 -> F32):   ~25%  (eliminated with QUANTIZED_MATMUL=1)
   Matrix operations (CPU):      ~10%
   Other (RoPE, Norm, etc.):      ~5%
 ```
+
+---
+
+## OpenAI-Compatible Server
+
+`moe-stream-server` provides an HTTP API compatible with OpenAI clients:
+
+- `POST /v1/chat/completions` -- SSE streaming and non-streaming JSON
+- `GET /v1/models` -- model listing
+- `GET /health` -- server health check
+
+The engine runs on a dedicated OS thread (non-Send due to Metal handles) with channel-based communication to async HTTP handlers.
+
+See [CLI.md](CLI.md) for the full server API reference.
+
+---
+
+## MCP Server
+
+`moe-stream-server --mcp-stdio` exposes inference as MCP tools (stdio transport) for AI agent integration. Tools: `generate`, `chat`, `model_info`, `tokenize`.
 
 ---
 
@@ -330,9 +269,10 @@ Per-token breakdown (80B, SSD streaming mode):
 
 | Layer | Technology | Rationale |
 |-------|-----------|-----------|
-| Language | Rust | Memory safety + C-level performance + no Python dependency |
+| Language | Rust | Memory safety + C-level performance |
 | ML Framework | candle-core | Rust-native + Metal support |
+| GPU | Custom Metal shaders | MXFP4, Q5_0/Q8_0, fused RoPE/RMSNorm |
 | I/O | memmap2 + libc madvise | OS page cache + NVMe parallelism |
-| GPU | candle-metal-kernels | Apple Silicon Metal |
+| HTTP | axum + tokio | Async HTTP server |
+| MCP | rust-mcp-server | AI agent tool protocol |
 | Model Format | GGUF | Industry standard, built-in quantization |
-| Python Bindings | PyO3 + maturin | Planned for future release |
