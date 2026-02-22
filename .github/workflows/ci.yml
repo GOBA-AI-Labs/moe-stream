@@ -82,6 +82,8 @@ jobs:
           method: local
 
       - name: Build with CUDA
+        env:
+          CUDA_COMPUTE_CAP: "80"
         run: >
           cargo build
           --workspace
