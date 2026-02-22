@@ -5,18 +5,20 @@ SSD-streaming MoE inference engine for consumer hardware. Run 80B parameter Mixt
 ## Why moe-stream?
 
 - **Layer-adaptive pruned model support** -- handles models with different expert counts per layer (`experts_per_layer` metadata), which llama.cpp does not currently support
-- **SSD streaming for 80B models on 24GB hardware** -- stream models from NVMe with only ~4GB resident in memory
-- **Metal GPU + CPU hybrid inference** -- CPU for MoE expert compute (avoids Metal kernel launch overhead), Metal for embedding and LM head
+- **3 inference modes** -- GPU Resident, GPU Hybrid, SSD Streaming, auto-selected based on model size vs system RAM
+- **OpenAI-compatible HTTP server** -- `POST /v1/chat/completions` (SSE streaming + JSON), connect from any OpenAI client
+- **MCP server** -- expose inference as MCP tools for AI agent integration
+- **Metal GPU kernels** -- fused MXFP4 matvec, Q5_0/Q8_0 attention, RoPE, RMSNorm on Apple Silicon
 - **Q4 quantized matmul** -- skip dequantization, compute directly on Q4 weights for +79% speedup
-- **Server mode** -- persistent JSONL-over-stdin/stdout server for integration with benchmarking and evaluation pipelines
+- **JSONL server mode** -- persistent stdin/stdout server for benchmarking pipelines
 
 ## Supported Models
 
 | Model | Architecture | Params | Speed (24GB M4 Pro) |
 |-------|-------------|--------|---------------------|
-| Qwen3-Coder-Next 80B | 36 DeltaNet + 12 Attention, 512 experts top-10 + shared | 80B total / 3B active | ~2.1 tok/s (Q4 matmul) |
-| Qwen3-30B-A3B | 48 Attention, 128 experts top-8 | 30B total / 3B active | ~55 tok/s (GPU-resident) |
-| GPT-OSS-20B | 24 layers, 32 experts top-8, MXFP4 | 20B total | ~55 tok/s (GPU-resident) |
+| Qwen3-Coder-Next 80B | 36 DeltaNet + 12 Attention, 512 experts top-10 + shared | 80B total / 3B active | ~2.1 tok/s (SSD Streaming) |
+| Qwen3-30B-A3B | 48 Attention, 128 experts top-8 | 30B total / 3B active | ~55 tok/s (GPU Resident) |
+| GPT-OSS-20B | 24 layers, 32 experts top-8, MXFP4 | 20B total | ~17 tok/s (GPU Resident) |
 
 Additional model architectures (Llama, Mistral, DeepSeek, etc.) can be added via the `ModelAdapter` trait in `config.rs`.
 
@@ -44,11 +46,11 @@ These models have varying expert counts per layer and **require moe-stream** for
 ### Build
 
 ```bash
-# macOS (recommended)
-cargo build --release -p moe-stream-core --bin moe-stream --features accelerate
-
-# macOS with Metal GPU support
+# macOS (recommended: Metal GPU + vecLib acceleration)
 cargo build --release -p moe-stream-core --bin moe-stream --features metal,accelerate
+
+# Build the HTTP/MCP server
+cargo build --release -p moe-stream-server --features metal,accelerate
 
 # Linux (CPU-only)
 cargo build --release -p moe-stream-core --bin moe-stream
@@ -57,18 +59,49 @@ cargo build --release -p moe-stream-core --bin moe-stream
 cargo build --release -p moe-stream-core --bin moe-stream --features cuda
 ```
 
-### Generate Text
+### CLI Inference
 
 ```bash
-# Basic generation
-./target/release/moe-stream path/to/model.gguf
-
-# With prompt and streaming output
+# Interactive generation
 ./target/release/moe-stream path/to/model.gguf 100 \
   --prompt "def fibonacci(n):" --stream
 
-# Run as a persistent JSONL server
+# JSONL server (stdin/stdout)
 ./target/release/moe-stream path/to/model.gguf --server
+```
+
+### OpenAI-Compatible Server
+
+```bash
+# Start the HTTP server
+./target/release/moe-stream-server --model path/to/model.gguf --port 11434
+
+# Test with curl
+curl http://localhost:11434/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"local","messages":[{"role":"user","content":"Hello!"}],"stream":true}'
+
+# Connect from any OpenAI-compatible client
+export OPENAI_BASE_URL=http://localhost:11434/v1
+```
+
+### MCP Server (AI Agent Integration)
+
+```bash
+# Start as MCP server (stdio transport)
+./target/release/moe-stream-server --model path/to/model.gguf --mcp-stdio
+```
+
+Add to your MCP client configuration (e.g., `.claude/mcp.json`):
+```json
+{
+  "mcpServers": {
+    "moe-stream": {
+      "command": "./target/release/moe-stream-server",
+      "args": ["--model", "path/to/model.gguf", "--mcp-stdio"]
+    }
+  }
+}
 ```
 
 Place a `tokenizer.json` in the same directory as your GGUF file for automatic tokenizer detection, or pass `--tokenizer path/to/tokenizer.json` explicitly.
@@ -80,6 +113,20 @@ See [docs/CLI.md](docs/CLI.md) for the full CLI reference.
 Pre-built macOS and Linux binaries are available on the [Releases](https://github.com/GOBA-AI-Labs/moe-stream/releases) page. No Rust toolchain required.
 
 ## Architecture
+
+### Inference Modes
+
+The engine automatically selects the inference mode based on model size vs system RAM:
+
+| Mode | Condition | Strategy |
+|------|-----------|----------|
+| **GPU Resident** | GGUF < 80% RAM + Metal | All weights in Metal GPU memory |
+| **GPU Hybrid** | GGUF 80-90% RAM | Attention on GPU, experts from SSD |
+| **SSD Streaming** | GGUF > 90% RAM | Minimal resident memory, experts from NVMe |
+
+Override with `--device gpu` or `--device cpu`.
+
+### SSD Streaming Architecture
 
 ```
                     +------------------+
@@ -95,29 +142,28 @@ Pre-built macOS and Linux binaries are available on the [Releases](https://githu
   +--------+    +------------------------+
 ```
 
-**Why CPU for MoE decode?** During single-token decode, weight matrices are small (e.g., `[1, 2048] x [768, 2048]`). Metal kernel launch overhead (~10-50us per operation, hundreds of ops per step) exceeds the actual compute time. CPU avoids this overhead entirely and reads directly from mmap'd memory.
+### GPU Resident Architecture
 
-**Weight residency strategy:**
-- **Always resident (~4GB):** embedding table, LM head, MoE gate weights, attention weights
-- **Streamed from SSD:** MoE expert weights (~44GB), DeltaNet weights
+```
+  +--------+    +----------------------------+    +---------+
+  |  GGUF  +--->|    Metal GPU Compute       +--->| Output  |
+  |  (load |    | (embed, attention, experts,|    | Tokens  |
+  |  once) |    |  norms, LM head -- all GPU)|    +---------+
+  +--------+    +----------------------------+
+```
 
-The engine automatically selects the inference mode based on model size:
-- **GpuResident** (model < 80% RAM): All weights in Metal GPU memory, maximum speed
-- **GpuHybrid** (80-90% RAM): Attention on GPU, experts streamed from SSD
-- **SsdStreaming** (model > 90% RAM): Minimal resident memory, experts from NVMe SSD
-
-The engine uses `madvise(MADV_WILLNEED)` to batch-prefetch all selected expert slices before sequential processing, allowing the NVMe controller to queue parallel reads.
+Custom Metal kernels for MXFP4 (4-bit MX format), Q5_0/Q8_0 quantized attention, fused RoPE, and fused RMSNorm eliminate CPU-GPU transfer overhead.
 
 ## Performance
 
 Measured on Apple M4 Pro, 24GB unified memory, internal NVMe SSD.
 
-| Configuration | Size | Resident Memory | Decode Speed |
-|---------------|------|----------------|--------------|
-| GPT-OSS-20B Pruned, GPU-resident | 10.4 GB | ~10 GB | ~55 tok/s |
-| 30B-A3B Pruned-80%, GPU-resident | 14.0 GB | ~14 GB | ~55 tok/s |
-| 80B Q4_K_M Original, SSD streaming | ~48 GB | ~4 GB | ~0.6 tok/s |
-| 80B 50% pruned, Q4 matmul, SSD streaming | 24.4 GB | ~4 GB | ~2.1 tok/s |
+| Configuration | Size | Mode | Decode Speed |
+|---------------|------|------|--------------|
+| GPT-OSS-20B Pruned (MXFP4) | 10.4 GB | GPU Resident | ~17 tok/s |
+| 30B-A3B Pruned-80% (Q4_K_M) | 14.0 GB | GPU Resident | ~55 tok/s |
+| 80B 50% pruned (Q4_K_M) | 24.4 GB | SSD Streaming | ~2.1 tok/s |
+| 80B Q4_K_M Original | ~48 GB | SSD Streaming | ~0.6 tok/s |
 
 ## `experts_per_layer` Support
 
@@ -125,32 +171,39 @@ moe-stream supports the `experts_per_layer` GGUF metadata field, enabling infere
 
 Standard MoE inference engines assume a uniform expert count across all layers. Layer-adaptive pruning produces models where some layers retain all experts (important layers) while others are aggressively pruned. moe-stream reads the per-layer expert count from the GGUF metadata and correctly routes tokens to the available experts in each layer.
 
-## Python Bindings
-
-> PyO3/maturin-based Python bindings (`pip install moe-stream`) are planned for a future release. For now, the Rust CLI and JSONL server mode are recommended. The server protocol makes integration with Python scripts straightforward -- see [docs/CLI.md](docs/CLI.md) for the server API.
-
 ## Project Structure
 
 ```
 moe-stream/
-├── moe-stream-core/          # Pure Rust inference engine
+├── moe-stream-core/           # Pure Rust inference engine
 │   ├── src/
-│   │   ├── lib.rs             # Public API
-│   │   ├── config.rs          # Model config + type dispatch
-│   │   ├── chat_template.rs   # Chat template handling
-│   │   ├── gguf/              # Custom GGUF reader (mmap + expert slicing)
+│   │   ├── lib.rs              # Public API
+│   │   ├── config.rs           # Model config + architecture dispatch
+│   │   ├── chat_template.rs    # Chat template handling (8 formats)
+│   │   ├── gguf/               # Custom GGUF reader (mmap + expert slicing)
 │   │   ├── model/
-│   │   │   ├── engine.rs      # Main engine (load, generate, preload)
-│   │   │   ├── layer.rs       # Hybrid layer (DeltaNet / Attention / MoE)
-│   │   │   ├── deltanet.rs    # DeltaNet SSM forward pass
-│   │   │   ├── cache.rs       # Resident weight storage
-│   │   │   └── kv_cache.rs    # KV-cache for attention layers
-│   │   ├── ops/               # Activation, attention, norm operations
-│   │   ├── metal/             # Apple Metal GPU compute (feature-gated)
-│   │   └── tokenizer.rs       # Tokenizer wrapper
+│   │   │   ├── engine.rs       # Main engine (load, generate, preload)
+│   │   │   ├── layer.rs        # Hybrid layer (DeltaNet / Attention / MoE)
+│   │   │   ├── deltanet.rs     # DeltaNet SSM forward pass
+│   │   │   ├── cache.rs        # Resident weight storage
+│   │   │   └── kv_cache.rs     # KV-cache for attention layers
+│   │   ├── ops/                # Activation, attention, norm operations
+│   │   ├── metal/              # Apple Metal GPU compute (feature-gated)
+│   │   │   ├── mod.rs          # MXFP4, Q5_0/Q8_0, RoPE, RMSNorm kernels
+│   │   │   ├── mxfp4.metal     # MXFP4 4-bit matvec shader
+│   │   │   ├── fused_ops.metal # Fused RoPE + RMSNorm shader
+│   │   │   └── quantized_attn.metal  # Q5_0/Q8_0 attention shader
+│   │   └── tokenizer.rs        # Tokenizer wrapper
 │   └── src/bin/
-│       └── moe-stream.rs      # CLI binary + JSONL server
-└── docs/                      # Technical documentation
+│       └── moe-stream.rs       # CLI binary + JSONL server
+├── moe-stream-server/          # OpenAI-compatible HTTP + MCP server
+│   └── src/
+│       ├── main.rs             # CLI entry (--model, --port, --mcp-stdio)
+│       ├── engine_handle.rs    # Engine on dedicated thread, channel bridge
+│       ├── types.rs            # OpenAI-compatible request/response types
+│       ├── routes/             # HTTP endpoints (chat, models, health)
+│       └── mcp/                # MCP server (stdio transport)
+└── docs/                       # Technical documentation
 ```
 
 ## Links
@@ -173,8 +226,8 @@ Contributions are welcome! Please:
 
 1. Fork the repository
 2. Create a feature branch (`git checkout -b feature/my-feature`)
-3. Ensure your changes build: `cargo build --release -p moe-stream-core`
-4. Run tests: `cargo test -p moe-stream-core`
+3. Ensure your changes build: `cargo build --release --features metal,accelerate`
+4. Run tests: `cargo test`
 5. Open a pull request
 
 When reporting bugs, please include your hardware (especially RAM size), OS version, and the model you are using.
